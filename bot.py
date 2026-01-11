@@ -37,22 +37,34 @@ intents.message_content = True  # Required to read message content for spam dete
 # --- Bot Client Initialization ---
 bot = commands.Bot(command_prefix="/", intents=intents)
 
-# --- Whitelist ---
+# --- Whitelist & Blacklist ---
 WHITELIST_FILE = "whitelist.json"
+BLACKLIST_FILE = "blacklist.json"
 whitelist = set()
+blacklist = set()
+suspicious_messages = defaultdict(list)
 
-def load_whitelist():
-    """Loads the whitelist from a JSON file."""
-    global whitelist
+def load_lists():
+    """Loads the whitelist and blacklist from JSON files."""
+    global whitelist, blacklist
     if os.path.exists(WHITELIST_FILE):
         with open(WHITELIST_FILE, "r") as f:
             data = json.load(f)
             whitelist = set(data.get("whitelist", []))
+    if os.path.exists(BLACKLIST_FILE):
+        with open(BLACKLIST_FILE, "r") as f:
+            data = json.load(f)
+            blacklist = set(data.get("blacklist", []))
 
 def save_whitelist():
     """Saves the whitelist to a JSON file."""
     with open(WHITELIST_FILE, "w") as f:
         json.dump({"whitelist": list(whitelist)}, f)
+
+def save_blacklist():
+    """Saves the blacklist to a JSON file."""
+    with open(BLACKLIST_FILE, "w") as f:
+        json.dump({"blacklist": list(blacklist)}, f)
 
 # --- Spam Detection ---
 SPAM_THRESHOLD = 20  # Number of messages
@@ -94,6 +106,15 @@ raid_reports = defaultdict(lambda: {
     'deleted_webhooks': 0
 })
 
+async def get_audit_log_entry(guild, action, target_id):
+    """Reliably fetches an audit log entry with retries."""
+    for _ in range(5):
+        async for entry in guild.audit_logs(action=action, limit=5):
+            if entry.target.id == target_id:
+                return entry
+        await asyncio.sleep(1)
+    return None
+
 async def get_ai_analysis(raid_details):
     """Gets AI analysis of a raid event."""
     try:
@@ -125,9 +146,15 @@ async def send_raid_alert(guild, user, reason):
     embed.set_footer(text="Anti-Raid Bot")
 
     # Get AI analysis
-    raid_details = f"User: {user.name}#{user.discriminator} ({user.id})\nReason: {reason}"
+    raid_details = f"User: {user.name}#{user.discriminator} ({user.id})\nReason: {reason}\n\n**Raid Report:**\n"
+    report = raid_reports[guild.id]
+    for key, value in report.items():
+        if value > 0:
+            raid_details += f"- {key.replace('_', ' ').title()}: {value}\n"
     ai_analysis = await get_ai_analysis(raid_details)
+
     embed.add_field(name="AI Analysis", value=ai_analysis, inline=False)
+    embed.add_field(name="Recommended Actions", value="No immediate actions required. The user has been banned and the server has been restored.", inline=False)
 
     # Send a DM to the server owner
     if owner:
@@ -206,7 +233,7 @@ async def on_ready():
     """
     This function is called when the bot successfully connects to Discord.
     """
-    load_whitelist()
+    load_lists()
     print(f'Logged in as {bot.user.name} (ID: {bot.user.id})')
     print('------')
     for guild in bot.guilds:
@@ -238,6 +265,13 @@ async def on_guild_join(guild):
             print(f"Could not create #raid-logs-and-alerts channel in {guild.name}. Missing permissions.")
 
 @bot.event
+async def on_member_join(member):
+    """Checks if a joining member is on the blacklist."""
+    if member.id in blacklist:
+        await member.ban(reason="Blacklisted user.")
+        print(f"Banned blacklisted user {member.name}.")
+
+@bot.event
 async def on_guild_channel_delete(channel):
     """
     This function is called when a channel is deleted.
@@ -250,15 +284,7 @@ async def on_guild_channel_delete(channel):
         return
 
     # --- Raid Detection & Banning ---
-    # Check the audit log to find who deleted the channel.
-    # We add a small delay to ensure the audit log is updated.
-    await asyncio.sleep(2)
-
-    entry = None
-    async for e in guild.audit_logs(action=discord.AuditLogAction.channel_delete, limit=5):
-        if e.target.id == channel.id:
-            entry = e
-            break
+    entry = await get_audit_log_entry(guild, discord.AuditLogAction.channel_delete, channel.id)
 
     if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
         user = entry.user
@@ -275,6 +301,8 @@ async def on_guild_channel_delete(channel):
             print(f"Banning {user.name} for deleting multiple channels.")
             try:
                 await guild.ban(user, reason="Mass channel deletion.")
+                blacklist.add(user.id)
+                save_blacklist()
             except discord.Forbidden:
                 print(f"Could not ban {user.name}. Missing permissions.")
             except discord.HTTPException as e:
@@ -333,12 +361,7 @@ async def on_guild_channel_create(channel):
     This function is called when a channel is created, to keep the cache updated.
     """
     guild = channel.guild
-    await asyncio.sleep(2)
-    entry = None
-    async for e in guild.audit_logs(action=discord.AuditLogAction.channel_create, limit=5):
-        if e.target.id == channel.id:
-            entry = e
-            break
+    entry = await get_audit_log_entry(guild, discord.AuditLogAction.channel_create, channel.id)
 
     if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
         user = entry.user
@@ -350,6 +373,8 @@ async def on_guild_channel_create(channel):
             print(f"Banning {user.name} for creating multiple channels.")
             try:
                 await guild.ban(user, reason="Mass channel creation.")
+                blacklist.add(user.id)
+                save_blacklist()
                 # Delete the extra channels
                 channels_to_delete = [item[1] for item in user_actions[user.id]['channel_create']]
                 for channel_id in channels_to_delete:
@@ -365,17 +390,17 @@ async def on_guild_channel_create(channel):
             else:
                 raid_reports[guild.id]['banned_users'] += 1
                 await send_raid_alert(guild, user, "Mass channel creation.")
-
-    if guild.id in server_cache:
-        server_cache[guild.id]['channels'][channel.id] = {
-            'name': channel.name,
-            'type': channel.type,
-            'category_id': channel.category_id,
-            'position': channel.position,
-            'topic': getattr(channel, 'topic', None),
-            'overwrites': {role.id: perm for role, perm in channel.overwrites.items()}
-        }
-        print(f"Cached new channel '{channel.name}' in '{guild.name}'.")
+        else:
+            if guild.id in server_cache:
+                server_cache[guild.id]['channels'][channel.id] = {
+                    'name': channel.name,
+                    'type': channel.type,
+                    'category_id': channel.category_id,
+                    'position': channel.position,
+                    'topic': getattr(channel, 'topic', None),
+                    'overwrites': {role.id: perm for role, perm in channel.overwrites.items()}
+                }
+                print(f"Cached new channel '{channel.name}' in '{guild.name}'.")
 
 @bot.event
 async def on_guild_channel_update(before, after):
@@ -384,12 +409,7 @@ async def on_guild_channel_update(before, after):
     """
     guild = after.guild
     if before.name != after.name:
-        await asyncio.sleep(2)
-        entry = None
-        async for e in guild.audit_logs(action=discord.AuditLogAction.channel_update, limit=5):
-            if e.target.id == after.id:
-                entry = e
-                break
+        entry = await get_audit_log_entry(guild, discord.AuditLogAction.channel_update, after.id)
 
         if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
             user = entry.user
@@ -401,6 +421,8 @@ async def on_guild_channel_update(before, after):
                 print(f"Banning {user.name} for renaming multiple channels.")
                 try:
                     await guild.ban(user, reason="Mass channel renaming.")
+                    blacklist.add(user.id)
+                    save_blacklist()
                 except discord.Forbidden:
                     print(f"Could not ban {user.name}. Missing permissions.")
                 except discord.HTTPException as e:
@@ -439,11 +461,7 @@ async def on_guild_update(before, after):
     cached_server_info = server_cache.get(guild.id, {})
 
     # --- Raid Detection & Banning ---
-    await asyncio.sleep(2)
-    entry = None
-    async for e in guild.audit_logs(action=discord.AuditLogAction.guild_update, limit=5):
-        entry = e
-        break
+    entry = await get_audit_log_entry(guild, discord.AuditLogAction.guild_update, guild.id)
 
     if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
         user = entry.user
@@ -456,6 +474,8 @@ async def on_guild_update(before, after):
             print(f"Banning {user.name} for multiple server updates.")
             try:
                 await guild.ban(user, reason="Mass server updates.")
+                blacklist.add(user.id)
+                save_blacklist()
             except discord.Forbidden:
                 print(f"Could not ban {user.name}. Missing permissions.")
             except discord.HTTPException as e:
@@ -469,6 +489,7 @@ async def on_guild_update(before, after):
             try:
                 await after.edit(name=cached_server_info.get('name', before.name))
                 print(f"Reverted server name to '{cached_server_info.get('name', before.name)}'.")
+                raid_reports[guild.id]['renamed_server'] = 1
             except discord.Forbidden:
                 print("Could not revert server name. Missing permissions.")
 
@@ -483,11 +504,7 @@ async def on_webhooks_update(channel):
     This function is called when a webhook is created, updated, or deleted.
     """
     guild = channel.guild
-    await asyncio.sleep(2)
-    entry = None
-    async for e in guild.audit_logs(action=discord.AuditLogAction.webhook_create, limit=5):
-        entry = e
-        break
+    entry = await get_audit_log_entry(guild, discord.AuditLogAction.webhook_create, channel.id)
 
     if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
         user = entry.user
@@ -499,6 +516,8 @@ async def on_webhooks_update(channel):
             print(f"Banning {user.name} for creating multiple webhooks.")
             try:
                 await guild.ban(user, reason="Mass webhook creation.")
+                blacklist.add(user.id)
+                save_blacklist()
             except discord.Forbidden:
                 print(f"Could not ban {user.name}. Missing permissions.")
             except discord.HTTPException as e:
@@ -513,6 +532,28 @@ async def on_message(message):
     This function is called when a message is sent.
     """
     if message.webhook_id:
+        # Advanced webhook spam detection
+        if "@everyone" in message.content:
+            user_actions[message.webhook_id]['webhook_spam'].append(time.time())
+            if len(user_actions[message.webhook_id]['webhook_spam']) >= 5:
+                try:
+                    webhook = await bot.fetch_webhook(message.webhook_id)
+                    await webhook.delete(reason="Webhook spamming @everyone")
+                    print(f"Deleted webhook {webhook.name} for spamming @everyone.")
+                    raid_reports[message.guild.id]['deleted_webhooks'] += 1
+                    # Ban the creator of the webhook
+                    entry = None
+                    async for e in message.guild.audit_logs(action=discord.AuditLogAction.webhook_create, limit=10):
+                        if e.target.id == message.webhook_id:
+                            entry = e
+                            break
+                    if entry and entry.user:
+                        await message.guild.ban(entry.user, reason="Created a webhook that spammed @everyone.")
+                        blacklist.add(entry.user.id)
+                        save_blacklist()
+                except (discord.NotFound, discord.Forbidden):
+                    pass
+
         current_time = time.time()
         user_message_times[message.webhook_id].append(current_time)
 
@@ -530,6 +571,10 @@ async def on_message(message):
     if message.author.bot:
         return
 
+    # Suspicious message sniping
+    if any(keyword in message.content.lower() for keyword in [".nuke", ".raid"]):
+        suspicious_messages[message.guild.id].append(f"[{message.created_at}] {message.author}: {message.content}")
+
     current_time = time.time()
     user_message_times[message.author.id].append(current_time)
 
@@ -538,6 +583,8 @@ async def on_message(message):
         if current_time - user_message_times[message.author.id][0] < SPAM_TIMEFRAME:
             try:
                 await message.author.ban(reason="Spamming")
+                blacklist.add(message.author.id)
+                save_blacklist()
                 print(f"Banned {message.author} for spamming.")
                 # Optionally, delete the spam messages
                 await message.channel.purge(limit=SPAM_THRESHOLD, check=lambda m: m.author == message.author)
@@ -555,12 +602,7 @@ async def on_guild_role_create(role):
     """
     guild = role.guild
     # --- Raid Detection & Banning ---
-    await asyncio.sleep(2)
-    entry = None
-    async for e in guild.audit_logs(action=discord.AuditLogAction.role_create, limit=5):
-        if e.target.id == role.id:
-            entry = e
-            break
+    entry = await get_audit_log_entry(guild, discord.AuditLogAction.role_create, role.id)
 
     if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
         # Check for duplicate roles
@@ -580,6 +622,8 @@ async def on_guild_role_create(role):
             print(f"Banning {user.name} for creating multiple roles.")
             try:
                 await guild.ban(user, reason="Mass role creation.")
+                blacklist.add(user.id)
+                save_blacklist()
                 # Delete the extra roles
                 roles_to_delete = [item[1] for item in user_actions[user.id]['role_create']]
                 for role_id in roles_to_delete:
@@ -595,19 +639,19 @@ async def on_guild_role_create(role):
             else:
                 raid_reports[guild.id]['banned_users'] += 1
                 await send_raid_alert(guild, user, "Mass role creation.")
-
-    # Update cache after checks
-    if guild.id in server_cache:
-        server_cache[guild.id]['roles'][role.id] = {
-            'name': role.name,
-            'permissions': role.permissions,
-            'color': role.color,
-            'hoist': role.hoist,
-            'mentionable': role.mentionable,
-            'position': role.position,
-            'members': [member.id for member in role.members]
-        }
-        print(f"Cached new role '{role.name}' in '{guild.name}'.")
+        else:
+            # Update cache after checks
+            if guild.id in server_cache:
+                server_cache[guild.id]['roles'][role.id] = {
+                    'name': role.name,
+                    'permissions': role.permissions,
+                    'color': role.color,
+                    'hoist': role.hoist,
+                    'mentionable': role.mentionable,
+                    'position': role.position,
+                    'members': [member.id for member in role.members]
+                }
+                print(f"Cached new role '{role.name}' in '{guild.name}'.")
 
 @bot.event
 async def on_guild_role_update(before, after):
@@ -640,12 +684,7 @@ async def on_guild_role_delete(role):
         return
 
     # --- Raid Detection & Banning ---
-    await asyncio.sleep(2)
-    entry = None
-    async for e in guild.audit_logs(action=discord.AuditLogAction.role_delete, limit=5):
-        if e.target.id == role.id:
-            entry = e
-            break
+    entry = await get_audit_log_entry(guild, discord.AuditLogAction.role_delete, role.id)
 
     if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
         user = entry.user
@@ -658,6 +697,8 @@ async def on_guild_role_delete(role):
             print(f"Banning {user.name} for deleting multiple roles.")
             try:
                 await guild.ban(user, reason="Mass role deletion.")
+                blacklist.add(user.id)
+                save_blacklist()
             except discord.Forbidden:
                 print(f"Could not ban {user.name}. Missing permissions.")
             except discord.HTTPException as e:
@@ -678,10 +719,10 @@ async def on_guild_role_delete(role):
         print(f"Recreated role '{recreated_role.name}' in '{guild.name}'.")
         raid_reports[guild.id]['deleted_roles'] += 1
 
-        # Re-assign the role to the original members
+        # Re-assign the role to the original members who are still in the server
         for member_id in cached_role_info.get('members', []):
             member = guild.get_member(member_id)
-            if member:
+            if member and member in guild.members:
                 try:
                     await member.add_roles(recreated_role)
                 except discord.Forbidden:
@@ -701,19 +742,17 @@ async def on_member_update(before, after):
     guild = after.guild
     # --- Permission Escalation Detection ---
     if not before.guild_permissions.administrator and after.guild_permissions.administrator:
-        await asyncio.sleep(2)
-        entry = None
-        async for e in guild.audit_logs(action=discord.AuditLogAction.member_role_update, limit=5):
-            if e.target.id == after.id:
-                entry = e
-                break
+        entry = await get_audit_log_entry(guild, discord.AuditLogAction.member_role_update, after.id)
 
         if entry and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
             actor = entry.user
             print(f"Banning {actor.name} and {after.name} for permission escalation.")
             try:
                 await guild.ban(actor, reason="Permission escalation.")
+                blacklist.add(actor.id)
                 await guild.ban(after, reason="Permission escalation.")
+                blacklist.add(after.id)
+                save_blacklist()
                 await after.remove_roles(*[role for role in after.roles if role.permissions.administrator])
             except discord.Forbidden:
                 print("Could not ban users or remove roles. Missing permissions.")
@@ -726,12 +765,7 @@ async def on_member_update(before, after):
 
     # --- Mass Member Renaming Protection ---
     if before.nick != after.nick:
-        await asyncio.sleep(2)
-        entry = None
-        async for e in guild.audit_logs(action=discord.AuditLogAction.member_update, limit=5):
-            if e.target.id == after.id:
-                entry = e
-                break
+        entry = await get_audit_log_entry(guild, discord.AuditLogAction.member_update, after.id)
 
         if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
             user = entry.user
@@ -743,6 +777,19 @@ async def on_member_update(before, after):
                 print(f"Banning {user.name} for renaming multiple members.")
                 try:
                     await guild.ban(user, reason="Mass member renaming.")
+                    blacklist.add(user.id)
+                    save_blacklist()
+                    # Revert the nicknames of all affected members
+                    members_to_revert = [item[1] for item in user_actions[user.id]['member_rename']]
+                    for member_id in members_to_revert:
+                        member = guild.get_member(member_id)
+                        if member:
+                            try:
+                                await member.edit(nick=None) # Reset to default username
+                                raid_reports[guild.id]['renamed_members'] += 1
+                            except discord.Forbidden:
+                                print(f"Could not revert nickname for '{member.name}'. Missing permissions.")
+                    user_actions[user.id]['member_rename'] = []
                 except discord.Forbidden:
                     print(f"Could not ban {user.name}. Missing permissions.")
                 except discord.HTTPException as e:
@@ -750,26 +797,21 @@ async def on_member_update(before, after):
                 else:
                     raid_reports[guild.id]['banned_users'] += 1
                     await send_raid_alert(guild, user, "Mass member renaming.")
-
-            # Revert the nickname
-            try:
-                await after.edit(nick=before.nick)
-                print(f"Reverted nickname for '{after.name}'.")
-                raid_reports[guild.id]['renamed_members'] += 1
-            except discord.Forbidden:
-                print(f"Could not revert nickname for '{after.name}'. Missing permissions.")
+            else:
+                # Revert the nickname
+                try:
+                    await after.edit(nick=before.nick)
+                    print(f"Reverted nickname for '{after.name}'.")
+                    raid_reports[guild.id]['renamed_members'] += 1
+                except discord.Forbidden:
+                    print(f"Could not revert nickname for '{after.name}'. Missing permissions.")
 
 @bot.event
 async def on_member_ban(guild, user):
     """
     This function is called when a member is banned.
     """
-    await asyncio.sleep(2)
-    entry = None
-    async for e in guild.audit_logs(action=discord.AuditLogAction.ban, limit=5):
-        if e.target.id == user.id:
-            entry = e
-            break
+    entry = await get_audit_log_entry(guild, discord.AuditLogAction.ban, user.id)
 
     if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
         actor = entry.user
@@ -781,6 +823,8 @@ async def on_member_ban(guild, user):
             print(f"Banning {actor.name} for mass banning.")
             try:
                 await guild.ban(actor, reason="Mass banning.")
+                blacklist.add(actor.id)
+                save_blacklist()
                 # Unban the users who were banned by the raider
                 users_to_unban = [item[1] for item in user_actions[actor.id]['ban']]
                 for user_id in users_to_unban:
@@ -802,12 +846,7 @@ async def on_member_remove(member):
     This function is called when a member is removed (kicked or leaves).
     """
     guild = member.guild
-    await asyncio.sleep(2)
-    entry = None
-    async for e in guild.audit_logs(action=discord.AuditLogAction.kick, limit=5):
-        if e.target.id == member.id:
-            entry = e
-            break
+    entry = await get_audit_log_entry(guild, discord.AuditLogAction.kick, member.id)
 
     if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
         actor = entry.user
@@ -819,6 +858,8 @@ async def on_member_remove(member):
             print(f"Banning {actor.name} for mass kicking.")
             try:
                 await guild.ban(actor, reason="Mass kicking.")
+                blacklist.add(actor.id)
+                save_blacklist()
             except discord.Forbidden:
                 print(f"Could not ban {actor.name}. Missing permissions.")
             except discord.HTTPException as e:
@@ -847,12 +888,7 @@ async def on_guild_emojis_update(guild, before, after):
     if deleted_emojis:
         # For simplicity, we'll only check the audit log for the first deleted emoji
         emoji = deleted_emojis[0]
-        await asyncio.sleep(2)
-        entry = None
-        async for e in guild.audit_logs(action=discord.AuditLogAction.emoji_delete, limit=5):
-            if e.target.id == emoji.id:
-                entry = e
-                break
+        entry = await get_audit_log_entry(guild, discord.AuditLogAction.emoji_delete, emoji.id)
 
         if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
             user = entry.user
@@ -864,6 +900,8 @@ async def on_guild_emojis_update(guild, before, after):
                 print(f"Banning {user.name} for deleting multiple emojis.")
                 try:
                     await guild.ban(user, reason="Mass emoji deletion.")
+                    blacklist.add(user.id)
+                    save_blacklist()
                 except discord.Forbidden:
                     print(f"Could not ban {user.name}. Missing permissions.")
                 except discord.HTTPException as e:
@@ -908,12 +946,7 @@ async def on_guild_stickers_update(guild, before, after):
     deleted_stickers = [sticker for sticker in before if sticker not in after]
     if deleted_stickers:
         sticker = deleted_stickers[0]
-        await asyncio.sleep(2)
-        entry = None
-        async for e in guild.audit_logs(action=discord.AuditLogAction.sticker_delete, limit=5):
-            if e.target.id == sticker.id:
-                entry = e
-                break
+        entry = await get_audit_log_entry(guild, discord.AuditLogAction.sticker_delete, sticker.id)
 
         if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
             user = entry.user
@@ -925,6 +958,8 @@ async def on_guild_stickers_update(guild, before, after):
                 print(f"Banning {user.name} for deleting multiple stickers.")
                 try:
                     await guild.ban(user, reason="Mass sticker deletion.")
+                    blacklist.add(user.id)
+                    save_blacklist()
                 except discord.Forbidden:
                     print(f"Could not ban {user.name}. Missing permissions.")
                 except discord.HTTPException as e:
@@ -946,7 +981,7 @@ async def on_guild_stickers_update(guild, before, after):
 
     server_cache[guild.id]['stickers'] = {sticker.id: {'name': sticker.name, 'url': sticker.url} for sticker in after}
 
-# --- Whitelist Commands ---
+# --- Whitelist & Blacklist Commands ---
 @bot.tree.command(name="whitelist", description="Add a user to the whitelist.")
 @commands.has_permissions(administrator=True)
 async def whitelist_command(interaction: discord.Interaction, user: discord.User):
@@ -968,6 +1003,21 @@ async def unwhitelist_command(interaction: discord.Interaction, user: discord.Us
         whitelist.remove(user.id)
         save_whitelist()
         await interaction.response.send_message(f"{user.name} has been removed from the whitelist.")
+
+@bot.tree.command(name="unblacklist", description="Remove a user from the blacklist.")
+@commands.has_permissions(administrator=True)
+async def unblacklist_command(interaction: discord.Interaction, user_id: str):
+    """Removes a user from the blacklist."""
+    try:
+        user_id = int(user_id)
+        if user_id not in blacklist:
+            await interaction.response.send_message(f"{user_id} is not blacklisted.")
+        else:
+            blacklist.remove(user_id)
+            save_blacklist()
+            await interaction.response.send_message(f"{user_id} has been removed from the blacklist.")
+    except ValueError:
+        await interaction.response.send_message("Invalid user ID.")
 
 @bot.tree.command(name="refresh", description="Refresh the server's cached structure.")
 @commands.has_permissions(administrator=True)
@@ -999,8 +1049,18 @@ async def raidreport_command(interaction: discord.Interaction):
     embed.add_field(name="Deleted Stickers", value=report['deleted_stickers'], inline=True)
     embed.add_field(name="Deleted Webhooks", value=report['deleted_webhooks'], inline=True)
 
-    await interaction.response.send_message(embed=embed)
-    raid_reports[interaction.guild.id] = defaultdict(int)
+    # Add suspicious messages to the report
+    if suspicious_messages[interaction.guild.id]:
+        with open("suspicious_messages.txt", "w") as f:
+            for msg in suspicious_messages[interaction.guild.id]:
+                f.write(f"{msg}\n")
+        await interaction.response.send_message(embed=embed, file=discord.File("suspicious_messages.txt"))
+        os.remove("suspicious_messages.txt")
+        suspicious_messages[interaction.guild.id] = []
+    else:
+        await interaction.response.send_message(embed=embed)
+
+    raid_reports.pop(interaction.guild.id, None)
 
 # --- Main Execution ---
 if __name__ == "__main__":
