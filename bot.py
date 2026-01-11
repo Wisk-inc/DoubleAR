@@ -9,6 +9,7 @@ import datetime
 import json
 import openai
 from dotenv import load_dotenv
+import io
 
 load_dotenv()
 
@@ -17,8 +18,10 @@ load_dotenv()
 # You will need to create a .env file with the following line:
 # DISCORD_BOT_TOKEN="YOUR_BOT_TOKEN"
 # OPENROUTER_API_KEY="YOUR_OPENROUTER_API_KEY"
+# OPENROUTER_MODEL="YOUR_OPENROUTER_MODEL"
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "mistralai/mistral-7b-instruct:free")
 
 # --- AI Configuration ---
 client = openai.OpenAI(
@@ -119,7 +122,7 @@ async def get_ai_analysis(raid_details):
     """Gets AI analysis of a raid event."""
     try:
         response = client.chat.completions.create(
-            model="deepseek/deepseek-chat-v3.1:free",
+            model=OPENROUTER_MODEL,
             messages=[
                 {"role": "system", "content": "You are a security expert analyzing a Discord raid."},
                 {"role": "user", "content": f"Analyze the following raid details and provide a summary and recommended actions:\n\n{raid_details}"},
@@ -171,6 +174,10 @@ async def send_raid_alert(guild, user, reason):
         except discord.Forbidden:
             print(f"Could not send a message to the #raid-logs-and-alerts channel in '{guild.name}'.")
 
+def is_unauthorized_actor(user, guild):
+    """Checks if a user is an unauthorized actor."""
+    return user and user != bot.user and user != guild.owner and user.id not in whitelist
+
 # --- Data Caching ---
 # This dictionary will store the structure of each server the bot is in.
 # The key is the guild ID, and the value is a dictionary of server information.
@@ -217,14 +224,17 @@ async def cache_server_structure(guild):
     for emoji in guild.emojis:
         server_cache[guild.id]['emojis'][emoji.id] = {
             'name': emoji.name,
-            'url': emoji.url
+            'url': emoji.url,
+            'animated': emoji.animated
         }
 
     # Cache stickers
     for sticker in guild.stickers:
         server_cache[guild.id]['stickers'][sticker.id] = {
             'name': sticker.name,
-            'url': sticker.url
+            'url': sticker.url,
+            'description': sticker.description,
+            'emoji': sticker.emoji
         }
 
 # --- Event Handlers ---
@@ -277,83 +287,73 @@ async def on_guild_channel_delete(channel):
     This function is called when a channel is deleted.
     """
     guild = channel.guild
-    cached_channel_info = server_cache.get(guild.id, {}).get('channels', {}).get(channel.id)
-
-    if not cached_channel_info:
-        print(f"Deleted channel '{channel.name}' not found in cache.")
-        return
-
-    # --- Raid Detection & Banning ---
     entry = await get_audit_log_entry(guild, discord.AuditLogAction.channel_delete, channel.id)
 
-    if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
+    if is_unauthorized_actor(entry.user, guild):
         user = entry.user
         current_time = time.time()
 
-        # Clean up old actions
-        user_actions[user.id]['channel_delete'] = [item for item in user_actions[user.id]['channel_delete'] if current_time - item[0] < ACTION_TIMEFRAME]
-
-        # Record new action
         user_actions[user.id]['channel_delete'].append((current_time, channel.id))
 
-        # Check if threshold is exceeded
+        # Immediately restore the deleted channel
+        cached_channel_info = server_cache.get(guild.id, {}).get('channels', {}).get(channel.id)
+        if cached_channel_info:
+            try:
+                category = guild.get_channel(cached_channel_info['category_id']) if cached_channel_info.get('category_id') else None
+                overwrites = {}
+                for role_id, perms in cached_channel_info.get('overwrites', {}).items():
+                    role = guild.get_role(role_id)
+                    if role:
+                        overwrites[role] = perms
+
+                recreated_channel = None
+                channel_type = cached_channel_info['type']
+
+                if channel_type == discord.ChannelType.text:
+                    recreated_channel = await guild.create_text_channel(
+                        name=cached_channel_info['name'],
+                        category=category,
+                        topic=cached_channel_info.get('topic'),
+                        position=cached_channel_info['position'],
+                        overwrites=overwrites
+                    )
+                elif channel_type == discord.ChannelType.voice:
+                    recreated_channel = await guild.create_voice_channel(
+                        name=cached_channel_info['name'],
+                        category=category,
+                        position=cached_channel_info['position'],
+                        overwrites=overwrites
+                    )
+                elif channel_type == discord.ChannelType.category:
+                    recreated_channel = await guild.create_category(
+                        name=cached_channel_info['name'],
+                        position=cached_channel_info['position'],
+                        overwrites=overwrites
+                    )
+
+                if recreated_channel:
+                    print(f"Recreated channel '{recreated_channel.name}' in '{guild.name}'.")
+                    raid_reports[guild.id]['deleted_channels'] += 1
+
+            except discord.Forbidden:
+                print(f"Could not restore channel '{cached_channel_info['name']}'. Missing permissions.")
+            except discord.HTTPException as e:
+                print(f"Failed to restore channel '{cached_channel_info['name']}': {e}")
+
+        # Check if the user has reached the threshold for banning
         if len(user_actions[user.id]['channel_delete']) >= CHANNEL_DELETE_THRESHOLD:
             print(f"Banning {user.name} for deleting multiple channels.")
             try:
                 await guild.ban(user, reason="Mass channel deletion.")
                 blacklist.add(user.id)
                 save_blacklist()
+                raid_reports[guild.id]['banned_users'] += 1
+                await send_raid_alert(guild, user, "Mass channel deletion.")
+                user_actions[user.id]['channel_delete'] = []
             except discord.Forbidden:
                 print(f"Could not ban {user.name}. Missing permissions.")
             except discord.HTTPException as e:
                 print(f"Failed to ban {user.name}: {e}")
-            else:
-                raid_reports[guild.id]['banned_users'] += 1
-                await send_raid_alert(guild, user, "Mass channel deletion.")
-
-    # --- Channel Restoration ---
-    try:
-        category = guild.get_channel(cached_channel_info['category_id']) if cached_channel_info.get('category_id') else None
-
-        overwrites = {}
-        for role_id, perms in cached_channel_info.get('overwrites', {}).items():
-            role = guild.get_role(role_id)
-            if role:
-                overwrites[role] = perms
-
-        recreated_channel = None
-        channel_type = cached_channel_info['type']
-
-        if channel_type == discord.ChannelType.text:
-            recreated_channel = await guild.create_text_channel(
-                name=cached_channel_info['name'],
-                category=category,
-                topic=cached_channel_info.get('topic'),
-                position=cached_channel_info['position'],
-                overwrites=overwrites
-            )
-        elif channel_type == discord.ChannelType.voice:
-            recreated_channel = await guild.create_voice_channel(
-                name=cached_channel_info['name'],
-                category=category,
-                position=cached_channel_info['position'],
-                overwrites=overwrites
-            )
-        elif channel_type == discord.ChannelType.category:
-            recreated_channel = await guild.create_category(
-                name=cached_channel_info['name'],
-                position=cached_channel_info['position'],
-                overwrites=overwrites
-            )
-
-        if recreated_channel:
-            print(f"Recreated channel '{recreated_channel.name}' in '{guild.name}'.")
-            raid_reports[guild.id]['deleted_channels'] += 1
-
-    except discord.Forbidden:
-        print(f"Could not restore channel '{cached_channel_info['name']}'. Missing permissions.")
-    except discord.HTTPException as e:
-        print(f"Failed to restore channel '{cached_channel_info['name']}': {e}")
 
 @bot.event
 async def on_guild_channel_create(channel):
@@ -363,7 +363,7 @@ async def on_guild_channel_create(channel):
     guild = channel.guild
     entry = await get_audit_log_entry(guild, discord.AuditLogAction.channel_create, channel.id)
 
-    if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
+    if is_unauthorized_actor(entry.user, guild):
         user = entry.user
         current_time = time.time()
         user_actions[user.id]['channel_create'] = [item for item in user_actions[user.id]['channel_create'] if current_time - item[0] < ACTION_TIMEFRAME]
@@ -411,7 +411,7 @@ async def on_guild_channel_update(before, after):
     if before.name != after.name:
         entry = await get_audit_log_entry(guild, discord.AuditLogAction.channel_update, after.id)
 
-        if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
+        if is_unauthorized_actor(entry.user, guild):
             user = entry.user
             current_time = time.time()
             user_actions[user.id]['channel_rename'] = [item for item in user_actions[user.id]['channel_rename'] if current_time - item[0] < ACTION_TIMEFRAME]
@@ -440,17 +440,28 @@ async def on_guild_channel_update(before, after):
                     raid_reports[guild.id]['renamed_channels'] += 1
                 except discord.Forbidden:
                     print(f"Could not revert channel name for '{after.name}'. Missing permissions.")
-
-    if guild.id in server_cache:
-        server_cache[guild.id]['channels'][after.id] = {
-            'name': after.name,
-            'type': after.type,
-            'category_id': after.category_id,
-            'position': after.position,
-            'topic': getattr(after, 'topic', None),
-            'overwrites': {role.id: perm for role, perm in after.overwrites.items()}
-        }
-        print(f"Updated cached channel '{after.name}' in '{guild.name}'.")
+        else:
+            if guild.id in server_cache:
+                server_cache[guild.id]['channels'][after.id] = {
+                    'name': after.name,
+                    'type': after.type,
+                    'category_id': after.category_id,
+                    'position': after.position,
+                    'topic': getattr(after, 'topic', None),
+                    'overwrites': {role.id: perm for role, perm in after.overwrites.items()}
+                }
+                print(f"Updated cached channel '{after.name}' in '{guild.name}'.")
+    else:
+        if guild.id in server_cache:
+            server_cache[guild.id]['channels'][after.id] = {
+                'name': after.name,
+                'type': after.type,
+                'category_id': after.category_id,
+                'position': after.position,
+                'topic': getattr(after, 'topic', None),
+                'overwrites': {role.id: perm for role, perm in after.overwrites.items()}
+            }
+            print(f"Updated cached channel '{after.name}' in '{guild.name}'.")
 
 @bot.event
 async def on_guild_update(before, after):
@@ -463,7 +474,7 @@ async def on_guild_update(before, after):
     # --- Raid Detection & Banning ---
     entry = await get_audit_log_entry(guild, discord.AuditLogAction.guild_update, guild.id)
 
-    if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
+    if is_unauthorized_actor(entry.user, guild):
         user = entry.user
         current_time = time.time()
 
@@ -506,7 +517,7 @@ async def on_webhooks_update(channel):
     guild = channel.guild
     entry = await get_audit_log_entry(guild, discord.AuditLogAction.webhook_create, channel.id)
 
-    if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
+    if is_unauthorized_actor(entry.user, guild):
         user = entry.user
         current_time = time.time()
         user_actions[user.id]['webhook_create'] = [t for t in user_actions[user.id]['webhook_create'] if current_time - t < ACTION_TIMEFRAME]
@@ -604,7 +615,7 @@ async def on_guild_role_create(role):
     # --- Raid Detection & Banning ---
     entry = await get_audit_log_entry(guild, discord.AuditLogAction.role_create, role.id)
 
-    if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
+    if is_unauthorized_actor(entry.user, guild):
         # Check for duplicate roles
         for r in guild.roles:
             if r.name == role.name and r.id != role.id:
@@ -659,17 +670,35 @@ async def on_guild_role_update(before, after):
     This function is called when a role is updated, to keep the cache updated.
     """
     guild = after.guild
-    if guild.id in server_cache:
-        server_cache[guild.id]['roles'][after.id] = {
-            'name': after.name,
-            'permissions': after.permissions,
-            'color': after.color,
-            'hoist': after.hoist,
-            'mentionable': after.mentionable,
-            'position': after.position,
-            'members': [member.id for member in after.members]
-        }
-        print(f"Updated cached role '{after.name}' in '{guild.name}'.")
+    entry = await get_audit_log_entry(guild, discord.AuditLogAction.role_update, after.id)
+
+    if is_unauthorized_actor(entry.user, guild):
+        # Malicious update, revert and don't update cache
+        try:
+            await after.edit(
+                name=before.name,
+                permissions=before.permissions,
+                color=before.color,
+                hoist=before.hoist,
+                mentionable=before.mentionable,
+                position=before.position
+            )
+            print(f"Reverted role update for '{after.name}'.")
+        except discord.Forbidden:
+            print(f"Could not revert role update for '{after.name}'. Missing permissions.")
+    else:
+        # Legitimate update, update cache
+        if guild.id in server_cache:
+            server_cache[guild.id]['roles'][after.id] = {
+                'name': after.name,
+                'permissions': after.permissions,
+                'color': after.color,
+                'hoist': after.hoist,
+                'mentionable': after.mentionable,
+                'position': after.position,
+                'members': [member.id for member in after.members]
+            }
+            print(f"Updated cached role '{after.name}' in '{guild.name}'.")
 
 @bot.event
 async def on_guild_role_delete(role):
@@ -686,7 +715,7 @@ async def on_guild_role_delete(role):
     # --- Raid Detection & Banning ---
     entry = await get_audit_log_entry(guild, discord.AuditLogAction.role_delete, role.id)
 
-    if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
+    if is_unauthorized_actor(entry.user, guild):
         user = entry.user
         current_time = time.time()
 
@@ -744,7 +773,7 @@ async def on_member_update(before, after):
     if not before.guild_permissions.administrator and after.guild_permissions.administrator:
         entry = await get_audit_log_entry(guild, discord.AuditLogAction.member_role_update, after.id)
 
-        if entry and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
+        if is_unauthorized_actor(entry.user, guild):
             actor = entry.user
             print(f"Banning {actor.name} and {after.name} for permission escalation.")
             try:
@@ -767,7 +796,7 @@ async def on_member_update(before, after):
     if before.nick != after.nick:
         entry = await get_audit_log_entry(guild, discord.AuditLogAction.member_update, after.id)
 
-        if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
+        if is_unauthorized_actor(entry.user, guild):
             user = entry.user
             current_time = time.time()
             user_actions[user.id]['member_rename'] = [item for item in user_actions[user.id]['member_rename'] if current_time - item[0] < ACTION_TIMEFRAME]
@@ -813,7 +842,7 @@ async def on_member_ban(guild, user):
     """
     entry = await get_audit_log_entry(guild, discord.AuditLogAction.ban, user.id)
 
-    if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
+    if is_unauthorized_actor(entry.user, guild):
         actor = entry.user
         current_time = time.time()
         user_actions[actor.id]['ban'] = [item for item in user_actions[actor.id]['ban'] if current_time - item[0] < ACTION_TIMEFRAME]
@@ -848,7 +877,7 @@ async def on_member_remove(member):
     guild = member.guild
     entry = await get_audit_log_entry(guild, discord.AuditLogAction.kick, member.id)
 
-    if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
+    if is_unauthorized_actor(entry.user, guild):
         actor = entry.user
         current_time = time.time()
         user_actions[actor.id]['kick'] = [item for item in user_actions[actor.id]['kick'] if current_time - item[0] < ACTION_TIMEFRAME]
@@ -890,7 +919,7 @@ async def on_guild_emojis_update(guild, before, after):
         emoji = deleted_emojis[0]
         entry = await get_audit_log_entry(guild, discord.AuditLogAction.emoji_delete, emoji.id)
 
-        if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
+        if is_unauthorized_actor(entry.user, guild):
             user = entry.user
             current_time = time.time()
             user_actions[user.id]['emoji_delete'] = [item for item in user_actions[user.id]['emoji_delete'] if current_time - item[0] < ACTION_TIMEFRAME]
@@ -922,11 +951,12 @@ async def on_guild_emojis_update(guild, before, after):
                                 await guild.create_custom_emoji(name=cached_emoji_info['name'], image=image_bytes)
                                 print(f"Restored emoji '{emoji.name}'.")
                                 raid_reports[guild.id]['deleted_emojis'] += 1
+                                await asyncio.sleep(1) # Prevent rate-limiting
                     except (discord.Forbidden, discord.HTTPException) as e:
                         print(f"Failed to restore emoji '{emoji.name}': {e}")
 
     # Update cache
-    server_cache[guild.id]['emojis'] = {emoji.id: {'name': emoji.name, 'url': emoji.url} for emoji in after}
+    server_cache[guild.id]['emojis'] = {emoji.id: {'name': emoji.name, 'url': emoji.url, 'animated': emoji.animated} for emoji in after}
 
 @bot.event
 async def on_guild_stickers_update(guild, before, after):
@@ -948,7 +978,7 @@ async def on_guild_stickers_update(guild, before, after):
         sticker = deleted_stickers[0]
         entry = await get_audit_log_entry(guild, discord.AuditLogAction.sticker_delete, sticker.id)
 
-        if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
+        if is_unauthorized_actor(entry.user, guild):
             user = entry.user
             current_time = time.time()
             user_actions[user.id]['sticker_delete'] = [item for item in user_actions[user.id]['sticker_delete'] if current_time - item[0] < ACTION_TIMEFRAME]
@@ -968,18 +998,22 @@ async def on_guild_stickers_update(guild, before, after):
                     raid_reports[guild.id]['banned_users'] += 1
                     await send_raid_alert(guild, user, "Mass sticker deletion.")
 
-        for sticker in deleted_stickers:
-            cached_sticker_info = server_cache.get(guild.id, {}).get('stickers', {}).get(sticker.id)
-            if cached_sticker_info:
-                try:
-                    # Sticker restoration from URL is complex and requires downloading the file
-                    # This is a simplified example
-                    print(f"Sticker '{sticker.name}' deleted. Manual restoration may be required.")
-                    raid_reports[guild.id]['deleted_stickers'] += 1
-                except (discord.Forbidden, discord.HTTPException) as e:
-                    print(f"Failed to restore sticker '{sticker.name}': {e}")
+        async with aiohttp.ClientSession() as session:
+            for sticker in deleted_stickers:
+                cached_sticker_info = server_cache.get(guild.id, {}).get('stickers', {}).get(sticker.id)
+                if cached_sticker_info:
+                    try:
+                        async with session.get(cached_sticker_info['url']) as resp:
+                            if resp.status == 200:
+                                image_bytes = await resp.read()
+                                await guild.create_sticker(name=cached_sticker_info['name'], description=cached_sticker_info['description'], emoji=cached_sticker_info['emoji'], file=discord.File(io.BytesIO(image_bytes)))
+                                print(f"Restored sticker '{sticker.name}'.")
+                                raid_reports[guild.id]['deleted_stickers'] += 1
+                                await asyncio.sleep(1) # Prevent rate-limiting
+                    except (discord.Forbidden, discord.HTTPException) as e:
+                        print(f"Failed to restore sticker '{sticker.name}': {e}")
 
-    server_cache[guild.id]['stickers'] = {sticker.id: {'name': sticker.name, 'url': sticker.url} for sticker in after}
+    server_cache[guild.id]['stickers'] = {sticker.id: {'name': sticker.name, 'url': sticker.url, 'description': sticker.description, 'emoji': sticker.emoji} for sticker in after}
 
 # --- Whitelist & Blacklist Commands ---
 @bot.tree.command(name="whitelist", description="Add a user to the whitelist.")
