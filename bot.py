@@ -129,9 +129,12 @@ async def get_ai_analysis(raid_details):
             ],
         )
         return response.choices[0].message.content
+    except openai.AuthenticationError:
+        print("Error: Invalid OpenRouter API key. Please check your .env file and ensure the key is correct.")
+        return "Could not get AI analysis due to an authentication error."
     except Exception as e:
         print(f"Error getting AI analysis: {e}")
-        return "Could not get AI analysis."
+        return "Could not get AI analysis due to an unexpected error."
 
 async def send_raid_alert(guild, user, reason):
     """
@@ -370,28 +373,40 @@ async def on_guild_channel_create(channel):
         user_actions[user.id]['channel_create'].append((current_time, channel.id))
 
         if len(user_actions[user.id]['channel_create']) >= CHANNEL_CREATE_THRESHOLD:
-            print(f"Banning {user.name} for creating multiple channels.")
+            print(f"Detected mass channel creation by {user.name}. Banning and deleting channels.")
             try:
+                # First, ban the user to prevent further actions
                 await guild.ban(user, reason="Mass channel creation.")
                 blacklist.add(user.id)
                 save_blacklist()
-                # Delete the extra channels
+                raid_reports[guild.id]['banned_users'] += 1
+                await send_raid_alert(guild, user, "Mass channel creation.")
+
+                # Then, delete all channels created by the user
                 channels_to_delete = [item[1] for item in user_actions[user.id]['channel_create']]
+                deleted_count = 0
                 for channel_id in channels_to_delete:
                     ch = guild.get_channel(channel_id)
                     if ch:
-                        await ch.delete()
-                raid_reports[guild.id]['created_channels'] += len(channels_to_delete)
-                user_actions[user.id]['channel_create'] = [] # Clear actions after handling
+                        try:
+                            await ch.delete(reason="Mass channel creation cleanup.")
+                            deleted_count += 1
+                        except discord.HTTPException as e:
+                            print(f"Failed to delete channel {channel_id}: {e}")
+
+                print(f"Deleted {deleted_count} channels created by {user.name}.")
+                raid_reports[guild.id]['created_channels'] += deleted_count
+                user_actions[user.id]['channel_create'] = []  # Clear actions after handling
+
             except discord.Forbidden:
-                print(f"Could not ban {user.name} or delete channels. Missing permissions.")
+                print(f"Could not ban {user.name} or delete channels due to missing permissions.")
             except discord.HTTPException as e:
-                print(f"Failed to ban {user.name} or delete channels: {e}")
-            else:
-                raid_reports[guild.id]['banned_users'] += 1
-                await send_raid_alert(guild, user, "Mass channel creation.")
+                print(f"An error occurred while banning {user.name} or deleting channels: {e}")
         else:
-            if guild.id in server_cache:
+            # This is a legitimate channel creation, so we should cache it.
+            # However, we must ensure it wasn't created by a user who was just banned.
+            banned_users_this_session = [u for u, data in user_actions.items() if 'channel_create' in data]
+            if user.id not in banned_users_this_session and guild.id in server_cache:
                 server_cache[guild.id]['channels'][channel.id] = {
                     'name': channel.name,
                     'type': channel.type,
@@ -1099,6 +1114,13 @@ async def raidreport_command(interaction: discord.Interaction):
 # --- Main Execution ---
 if __name__ == "__main__":
     if not BOT_TOKEN:
-        print("Error: The bot token is not set. Please create a .env file and set DISCORD_BOT_TOKEN.")
+        print("Error: The DISCORD_BOT_TOKEN is not set in your .env file. Please set it and try again.")
+    elif not OPENROUTER_API_KEY:
+        print("Error: The OPENROUTER_API_KEY is not set in your .env file. Please set it and try again.")
     else:
-        bot.run(BOT_TOKEN)
+        try:
+            bot.run(BOT_TOKEN)
+        except discord.errors.LoginFailure:
+            print("Error: Invalid Discord bot token. Please check your .env file and ensure the token is correct.")
+        except discord.errors.PrivilegedIntentsRequired:
+            print("Error: Privileged Gateway Intents are not enabled. Please go to your bot's settings in the Discord Developer Portal and enable the 'Server Members Intent' and 'Message Content Intent'.")
