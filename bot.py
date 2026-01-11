@@ -1,16 +1,30 @@
 import discord
+from discord.ext import commands
 import asyncio
 from collections import defaultdict, deque
 import time
 import os
 import aiohttp
 import datetime
+import json
+import openai
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # --- Bot Configuration ---
 # Load the bot token from an environment variable for better security.
 # You will need to create a .env file with the following line:
 # DISCORD_BOT_TOKEN="YOUR_BOT_TOKEN"
+# OPENROUTER_API_KEY="YOUR_OPENROUTER_API_KEY"
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+# --- AI Configuration ---
+client = openai.OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=OPENROUTER_API_KEY,
+)
 
 # --- Intent Configuration ---
 # The bot needs specific 'intents' to access certain events and data.
@@ -21,7 +35,24 @@ intents.members = True  # Required to track member joins, removes, and updates.
 intents.message_content = True  # Required to read message content for spam detection.
 
 # --- Bot Client Initialization ---
-client = discord.Client(intents=intents)
+bot = commands.Bot(command_prefix="/", intents=intents)
+
+# --- Whitelist ---
+WHITELIST_FILE = "whitelist.json"
+whitelist = set()
+
+def load_whitelist():
+    """Loads the whitelist from a JSON file."""
+    global whitelist
+    if os.path.exists(WHITELIST_FILE):
+        with open(WHITELIST_FILE, "r") as f:
+            data = json.load(f)
+            whitelist = set(data.get("whitelist", []))
+
+def save_whitelist():
+    """Saves the whitelist to a JSON file."""
+    with open(WHITELIST_FILE, "w") as f:
+        json.dump({"whitelist": list(whitelist)}, f)
 
 # --- Spam Detection ---
 SPAM_THRESHOLD = 20  # Number of messages
@@ -63,6 +94,21 @@ raid_reports = defaultdict(lambda: {
     'deleted_webhooks': 0
 })
 
+async def get_ai_analysis(raid_details):
+    """Gets AI analysis of a raid event."""
+    try:
+        response = client.chat.completions.create(
+            model="deepseek/deepseek-chat-v3.1:free",
+            messages=[
+                {"role": "system", "content": "You are a security expert analyzing a Discord raid."},
+                {"role": "user", "content": f"Analyze the following raid details and provide a summary and recommended actions:\n\n{raid_details}"},
+            ],
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"Error getting AI analysis: {e}")
+        return "Could not get AI analysis."
+
 async def send_raid_alert(guild, user, reason):
     """
     Sends an alert to the server owner and a designated channel when a raid is detected.
@@ -78,6 +124,11 @@ async def send_raid_alert(guild, user, reason):
     embed.add_field(name="Reason", value=reason, inline=False)
     embed.set_footer(text="Anti-Raid Bot")
 
+    # Get AI analysis
+    raid_details = f"User: {user.name}#{user.discriminator} ({user.id})\nReason: {reason}"
+    ai_analysis = await get_ai_analysis(raid_details)
+    embed.add_field(name="AI Analysis", value=ai_analysis, inline=False)
+
     # Send a DM to the server owner
     if owner:
         try:
@@ -86,12 +137,12 @@ async def send_raid_alert(guild, user, reason):
             print(f"Could not send a DM to the server owner of '{guild.name}'.")
 
     # Send a message to a designated raid-alerts channel
-    alert_channel = discord.utils.get(guild.text_channels, name="raid-alerts")
+    alert_channel = discord.utils.get(guild.text_channels, name="raid-logs-and-alerts")
     if alert_channel:
         try:
             await alert_channel.send(embed=embed)
         except discord.Forbidden:
-            print(f"Could not send a message to the #raid-alerts channel in '{guild.name}'.")
+            print(f"Could not send a message to the #raid-logs-and-alerts channel in '{guild.name}'.")
 
 # --- Data Caching ---
 # This dictionary will store the structure of each server the bot is in.
@@ -150,19 +201,26 @@ async def cache_server_structure(guild):
         }
 
 # --- Event Handlers ---
-@client.event
+@bot.event
 async def on_ready():
     """
     This function is called when the bot successfully connects to Discord.
     """
-    print(f'Logged in as {client.user.name} (ID: {client.user.id})')
+    load_whitelist()
+    print(f'Logged in as {bot.user.name} (ID: {bot.user.id})')
     print('------')
-    for guild in client.guilds:
+    for guild in bot.guilds:
         await cache_server_structure(guild)
         print(f'Cached server structure for {guild.name}')
     print('Anti-Raid Bot is online and ready to protect your server!')
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} command(s)")
+    except Exception as e:
+        print(e)
 
-@client.event
+
+@bot.event
 async def on_guild_join(guild):
     """
     This function is called when the bot joins a new guild.
@@ -170,7 +228,16 @@ async def on_guild_join(guild):
     await cache_server_structure(guild)
     print(f'Joined and cached server structure for {guild.name}')
 
-@client.event
+    # Create the raid-logs-and-alerts channel if it doesn't exist
+    channel = discord.utils.get(guild.text_channels, name="raid-logs-and-alerts")
+    if not channel:
+        try:
+            await guild.create_text_channel("raid-logs-and-alerts")
+            print(f"Created #raid-logs-and-alerts channel in {guild.name}")
+        except discord.Forbidden:
+            print(f"Could not create #raid-logs-and-alerts channel in {guild.name}. Missing permissions.")
+
+@bot.event
 async def on_guild_channel_delete(channel):
     """
     This function is called when a channel is deleted.
@@ -193,7 +260,7 @@ async def on_guild_channel_delete(channel):
             entry = e
             break
 
-    if entry and entry.user and entry.user != guild.owner:
+    if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
         user = entry.user
         current_time = time.time()
 
@@ -260,7 +327,7 @@ async def on_guild_channel_delete(channel):
     except discord.HTTPException as e:
         print(f"Failed to restore channel '{cached_channel_info['name']}': {e}")
 
-@client.event
+@bot.event
 async def on_guild_channel_create(channel):
     """
     This function is called when a channel is created, to keep the cache updated.
@@ -273,7 +340,7 @@ async def on_guild_channel_create(channel):
             entry = e
             break
 
-    if entry and entry.user and entry.user != guild.owner:
+    if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
         user = entry.user
         current_time = time.time()
         user_actions[user.id]['channel_create'] = [item for item in user_actions[user.id]['channel_create'] if current_time - item[0] < ACTION_TIMEFRAME]
@@ -310,7 +377,7 @@ async def on_guild_channel_create(channel):
         }
         print(f"Cached new channel '{channel.name}' in '{guild.name}'.")
 
-@client.event
+@bot.event
 async def on_guild_channel_update(before, after):
     """
     This function is called when a channel is updated, to keep the cache updated.
@@ -324,7 +391,7 @@ async def on_guild_channel_update(before, after):
                 entry = e
                 break
 
-        if entry and entry.user and entry.user != guild.owner:
+        if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
             user = entry.user
             current_time = time.time()
             user_actions[user.id]['channel_rename'] = [item for item in user_actions[user.id]['channel_rename'] if current_time - item[0] < ACTION_TIMEFRAME]
@@ -363,7 +430,7 @@ async def on_guild_channel_update(before, after):
         }
         print(f"Updated cached channel '{after.name}' in '{guild.name}'.")
 
-@client.event
+@bot.event
 async def on_guild_update(before, after):
     """
     This function is called when the guild is updated (e.g., name change).
@@ -378,7 +445,7 @@ async def on_guild_update(before, after):
         entry = e
         break
 
-    if entry and entry.user and entry.user != guild.owner:
+    if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
         user = entry.user
         current_time = time.time()
 
@@ -410,7 +477,7 @@ async def on_guild_update(before, after):
             # This is left as a potential future improvement.
             print(f"Server icon change detected. Manual restoration may be required.")
 
-@client.event
+@bot.event
 async def on_webhooks_update(channel):
     """
     This function is called when a webhook is created, updated, or deleted.
@@ -422,7 +489,7 @@ async def on_webhooks_update(channel):
         entry = e
         break
 
-    if entry and entry.user and entry.user != guild.owner:
+    if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
         user = entry.user
         current_time = time.time()
         user_actions[user.id]['webhook_create'] = [t for t in user_actions[user.id]['webhook_create'] if current_time - t < ACTION_TIMEFRAME]
@@ -440,7 +507,7 @@ async def on_webhooks_update(channel):
                 raid_reports[guild.id]['banned_users'] += 1
                 await send_raid_alert(guild, user, "Mass webhook creation.")
 
-@client.event
+@bot.event
 async def on_message(message):
     """
     This function is called when a message is sent.
@@ -452,7 +519,7 @@ async def on_message(message):
         if len(user_message_times[message.webhook_id]) == SPAM_THRESHOLD:
             if current_time - user_message_times[message.webhook_id][0] < SPAM_TIMEFRAME:
                 try:
-                    webhook = await client.fetch_webhook(message.webhook_id)
+                    webhook = await bot.fetch_webhook(message.webhook_id)
                     await webhook.delete(reason="Spamming")
                     print(f"Deleted webhook {webhook.name} for spamming.")
                     raid_reports[message.guild.id]['deleted_webhooks'] += 1
@@ -462,33 +529,6 @@ async def on_message(message):
 
     if message.author.bot:
         return
-
-    if message.content == '!raidreport':
-        report = raid_reports[message.guild.id]
-        embed = discord.Embed(
-            title="Raid Activity Report",
-            color=discord.Color.orange()
-        )
-        embed.add_field(name="Banned Users", value=report['banned_users'], inline=True)
-        embed.add_field(name="Unbanned Users", value=report['unbanned_users'], inline=True)
-        embed.add_field(name="Kicked Users", value=report['kicked_users'], inline=True)
-        embed.add_field(name="Deleted Channels", value=report['deleted_channels'], inline=True)
-        embed.add_field(name="Created Channels", value=report['created_channels'], inline=True)
-        embed.add_field(name="Deleted Roles", value=report['deleted_roles'], inline=True)
-        embed.add_field(name="Created Roles", value=report['created_roles'], inline=True)
-        embed.add_field(name="Renamed Channels", value=report['renamed_channels'], inline=True)
-        embed.add_field(name="Renamed Members", value=report['renamed_members'], inline=True)
-        embed.add_field(name="Deleted Emojis", value=report['deleted_emojis'], inline=True)
-        embed.add_field(name="Deleted Stickers", value=report['deleted_stickers'], inline=True)
-        embed.add_field(name="Deleted Webhooks", value=report['deleted_webhooks'], inline=True)
-
-        try:
-            await message.channel.send(embed=embed)
-        except discord.Forbidden:
-            print(f"Could not send raid report to {message.channel.name}. Missing permissions.")
-
-        # Reset the report for the guild
-        raid_reports[message.guild.id] = defaultdict(int)
 
     current_time = time.time()
     user_message_times[message.author.id].append(current_time)
@@ -508,7 +548,7 @@ async def on_message(message):
             else:
                 await send_raid_alert(message.guild, message.author, "Spamming.")
 
-@client.event
+@bot.event
 async def on_guild_role_create(role):
     """
     This function is called when a role is created.
@@ -522,7 +562,14 @@ async def on_guild_role_create(role):
             entry = e
             break
 
-    if entry and entry.user and entry.user != guild.owner:
+    if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
+        # Check for duplicate roles
+        for r in guild.roles:
+            if r.name == role.name and r.id != role.id:
+                await role.delete()
+                print(f"Deleted duplicate role '{role.name}'.")
+                return
+
         user = entry.user
         current_time = time.time()
 
@@ -562,7 +609,7 @@ async def on_guild_role_create(role):
         }
         print(f"Cached new role '{role.name}' in '{guild.name}'.")
 
-@client.event
+@bot.event
 async def on_guild_role_update(before, after):
     """
     This function is called when a role is updated, to keep the cache updated.
@@ -580,7 +627,7 @@ async def on_guild_role_update(before, after):
         }
         print(f"Updated cached role '{after.name}' in '{guild.name}'.")
 
-@client.event
+@bot.event
 async def on_guild_role_delete(role):
     """
     This function is called when a role is deleted.
@@ -600,7 +647,7 @@ async def on_guild_role_delete(role):
             entry = e
             break
 
-    if entry and entry.user and entry.user != guild.owner:
+    if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
         user = entry.user
         current_time = time.time()
 
@@ -646,7 +693,7 @@ async def on_guild_role_delete(role):
     except discord.HTTPException as e:
         print(f"Failed to restore role '{cached_role_info['name']}': {e}")
 
-@client.event
+@bot.event
 async def on_member_update(before, after):
     """
     This function is called when a member is updated (e.g., nickname change).
@@ -661,7 +708,7 @@ async def on_member_update(before, after):
                 entry = e
                 break
 
-        if entry and entry.user != guild.owner:
+        if entry and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
             actor = entry.user
             print(f"Banning {actor.name} and {after.name} for permission escalation.")
             try:
@@ -686,7 +733,7 @@ async def on_member_update(before, after):
                 entry = e
                 break
 
-        if entry and entry.user and entry.user != guild.owner:
+        if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
             user = entry.user
             current_time = time.time()
             user_actions[user.id]['member_rename'] = [item for item in user_actions[user.id]['member_rename'] if current_time - item[0] < ACTION_TIMEFRAME]
@@ -712,7 +759,7 @@ async def on_member_update(before, after):
             except discord.Forbidden:
                 print(f"Could not revert nickname for '{after.name}'. Missing permissions.")
 
-@client.event
+@bot.event
 async def on_member_ban(guild, user):
     """
     This function is called when a member is banned.
@@ -724,7 +771,7 @@ async def on_member_ban(guild, user):
             entry = e
             break
 
-    if entry and entry.user and entry.user != guild.owner:
+    if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
         actor = entry.user
         current_time = time.time()
         user_actions[actor.id]['ban'] = [item for item in user_actions[actor.id]['ban'] if current_time - item[0] < ACTION_TIMEFRAME]
@@ -737,7 +784,7 @@ async def on_member_ban(guild, user):
                 # Unban the users who were banned by the raider
                 users_to_unban = [item[1] for item in user_actions[actor.id]['ban']]
                 for user_id in users_to_unban:
-                    banned_user = await client.fetch_user(user_id)
+                    banned_user = await bot.fetch_user(user_id)
                     await guild.unban(banned_user)
                 raid_reports[guild.id]['unbanned_users'] += len(users_to_unban)
                 user_actions[actor.id]['ban'] = [] # Clear actions after handling
@@ -749,7 +796,7 @@ async def on_member_ban(guild, user):
                 raid_reports[guild.id]['banned_users'] += 1
                 await send_raid_alert(guild, actor, "Mass banning.")
 
-@client.event
+@bot.event
 async def on_member_remove(member):
     """
     This function is called when a member is removed (kicked or leaves).
@@ -762,7 +809,7 @@ async def on_member_remove(member):
             entry = e
             break
 
-    if entry and entry.user and entry.user != guild.owner:
+    if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
         actor = entry.user
         current_time = time.time()
         user_actions[actor.id]['kick'] = [item for item in user_actions[actor.id]['kick'] if current_time - item[0] < ACTION_TIMEFRAME]
@@ -780,11 +827,21 @@ async def on_member_remove(member):
                 raid_reports[guild.id]['banned_users'] += 1
                 await send_raid_alert(guild, actor, "Mass kicking.")
 
-@client.event
+@bot.event
 async def on_guild_emojis_update(guild, before, after):
     """
     This function is called when emojis are updated in a guild.
     """
+    # Find created emojis
+    created_emojis = [emoji for emoji in after if emoji not in before]
+    if created_emojis:
+        for emoji in created_emojis:
+            for e in guild.emojis:
+                if e.name == emoji.name and e.id != emoji.id:
+                    await emoji.delete()
+                    print(f"Deleted duplicate emoji '{emoji.name}'.")
+                    return
+
     # Find deleted emojis
     deleted_emojis = [emoji for emoji in before if emoji not in after]
     if deleted_emojis:
@@ -797,7 +854,7 @@ async def on_guild_emojis_update(guild, before, after):
                 entry = e
                 break
 
-        if entry and entry.user and entry.user != guild.owner:
+        if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
             user = entry.user
             current_time = time.time()
             user_actions[user.id]['emoji_delete'] = [item for item in user_actions[user.id]['emoji_delete'] if current_time - item[0] < ACTION_TIMEFRAME]
@@ -833,11 +890,21 @@ async def on_guild_emojis_update(guild, before, after):
     # Update cache
     server_cache[guild.id]['emojis'] = {emoji.id: {'name': emoji.name, 'url': emoji.url} for emoji in after}
 
-@client.event
+@bot.event
 async def on_guild_stickers_update(guild, before, after):
     """
     This function is called when stickers are updated in a guild.
     """
+    # Find created stickers
+    created_stickers = [sticker for sticker in after if sticker not in before]
+    if created_stickers:
+        for sticker in created_stickers:
+            for s in guild.stickers:
+                if s.name == sticker.name and s.id != sticker.id:
+                    await sticker.delete()
+                    print(f"Deleted duplicate sticker '{sticker.name}'.")
+                    return
+
     deleted_stickers = [sticker for sticker in before if sticker not in after]
     if deleted_stickers:
         sticker = deleted_stickers[0]
@@ -848,7 +915,7 @@ async def on_guild_stickers_update(guild, before, after):
                 entry = e
                 break
 
-        if entry and entry.user and entry.user != guild.owner:
+        if entry and entry.user and entry.user.id not in whitelist and entry.user != guild.owner and entry.user != bot.user:
             user = entry.user
             current_time = time.time()
             user_actions[user.id]['sticker_delete'] = [item for item in user_actions[user.id]['sticker_delete'] if current_time - item[0] < ACTION_TIMEFRAME]
@@ -879,10 +946,65 @@ async def on_guild_stickers_update(guild, before, after):
 
     server_cache[guild.id]['stickers'] = {sticker.id: {'name': sticker.name, 'url': sticker.url} for sticker in after}
 
+# --- Whitelist Commands ---
+@bot.tree.command(name="whitelist", description="Add a user to the whitelist.")
+@commands.has_permissions(administrator=True)
+async def whitelist_command(interaction: discord.Interaction, user: discord.User):
+    """Adds a user to the whitelist."""
+    if user.id in whitelist:
+        await interaction.response.send_message(f"{user.name} is already whitelisted.")
+    else:
+        whitelist.add(user.id)
+        save_whitelist()
+        await interaction.response.send_message(f"{user.name} has been added to the whitelist.")
+
+@bot.tree.command(name="unwhitelist", description="Remove a user from the whitelist.")
+@commands.has_permissions(administrator=True)
+async def unwhitelist_command(interaction: discord.Interaction, user: discord.User):
+    """Removes a user from the whitelist."""
+    if user.id not in whitelist:
+        await interaction.response.send_message(f"{user.name} is not whitelisted.")
+    else:
+        whitelist.remove(user.id)
+        save_whitelist()
+        await interaction.response.send_message(f"{user.name} has been removed from the whitelist.")
+
+@bot.tree.command(name="refresh", description="Refresh the server's cached structure.")
+@commands.has_permissions(administrator=True)
+async def refresh_command(interaction: discord.Interaction):
+    """Refreshes the server's cached structure."""
+    await interaction.response.defer()
+    await cache_server_structure(interaction.guild)
+    await interaction.followup.send("Server cache has been refreshed.")
+
+@bot.tree.command(name="raidreport", description="Get a report of the bot's anti-raid actions.")
+@commands.has_permissions(administrator=True)
+async def raidreport_command(interaction: discord.Interaction):
+    """Gets a report of the bot's anti-raid actions."""
+    report = raid_reports[interaction.guild.id]
+    embed = discord.Embed(
+        title="Raid Activity Report",
+        color=discord.Color.orange()
+    )
+    embed.add_field(name="Banned Users", value=report['banned_users'], inline=True)
+    embed.add_field(name="Unbanned Users", value=report['unbanned_users'], inline=True)
+    embed.add_field(name="Kicked Users", value=report['kicked_users'], inline=True)
+    embed.add_field(name="Deleted Channels", value=report['deleted_channels'], inline=True)
+    embed.add_field(name="Created Channels", value=report['created_channels'], inline=True)
+    embed.add_field(name="Deleted Roles", value=report['deleted_roles'], inline=True)
+    embed.add_field(name="Created Roles", value=report['created_roles'], inline=True)
+    embed.add_field(name="Renamed Channels", value=report['renamed_channels'], inline=True)
+    embed.add_field(name="Renamed Members", value=report['renamed_members'], inline=True)
+    embed.add_field(name="Deleted Emojis", value=report['deleted_emojis'], inline=True)
+    embed.add_field(name="Deleted Stickers", value=report['deleted_stickers'], inline=True)
+    embed.add_field(name="Deleted Webhooks", value=report['deleted_webhooks'], inline=True)
+
+    await interaction.response.send_message(embed=embed)
+    raid_reports[interaction.guild.id] = defaultdict(int)
 
 # --- Main Execution ---
 if __name__ == "__main__":
     if not BOT_TOKEN:
         print("Error: The bot token is not set. Please create a .env file and set DISCORD_BOT_TOKEN.")
     else:
-        client.run(BOT_TOKEN)
+        bot.run(BOT_TOKEN)

@@ -38,6 +38,6 @@ This bot is a proof-of-concept and has a few limitations that should be addresse
 
 -   **In-Memory Cache:** The bot's server cache is stored in memory, which means it will be lost if the bot restarts. For a production-ready bot, this should be replaced with a persistent storage solution, such as a database or a file-based cache.
 
--   **Hardcoded Whitelist:** Currently, only the server owner is exempt from the bot's anti-raid actions. In a real-world scenario, you would want to have a configurable whitelist of trusted users or roles who are allowed to perform mass actions.
+-   **Whitelist:** The bot uses a `whitelist.json` file to manage a list of trusted users who are exempt from the anti-raid actions. You can manage this list using the `/whitelist` and `/unwhitelist` commands.
 
 -   **Single-File Structure:** The bot's logic is contained in a single `bot.py` file. For better maintainability, this should be refactored into multiple files or by using the `discord.py` Cogs extension.
