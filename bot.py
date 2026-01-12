@@ -10,6 +10,7 @@ import json
 import openai
 from dotenv import load_dotenv
 import io
+import ai_tools
 
 load_dotenv()
 
@@ -39,6 +40,8 @@ intents.message_content = True  # Required to read message content for spam dete
 
 # --- Bot Client Initialization ---
 bot = commands.Bot(command_prefix="/", intents=intents)
+
+guild_ai_state = defaultdict(lambda: True)
 
 # --- Whitelist & Blacklist ---
 WHITELIST_FILE = "whitelist.json"
@@ -252,6 +255,18 @@ async def on_ready():
     for guild in bot.guilds:
         await cache_server_structure(guild)
         print(f'Cached server structure for {guild.name}')
+
+        # Check bot's role position
+        bot_member = guild.me
+        if bot_member:
+            top_role = bot_member.top_role
+            if top_role.position < len(guild.roles) - 2:  # Check if not one of the top roles
+                print(f"--- PERMISSION WARNING for '{guild.name}' ---")
+                print(f"The bot's highest role, '{top_role.name}', is low in the role hierarchy.")
+                print("It may not be able to manage roles or members above it.")
+                print("Please move the bot's role to the top of the list in Server Settings > Roles for full functionality.")
+                print("-------------------------------------------------")
+
     print('Anti-Raid Bot is online and ready to protect your server!')
     try:
         synced = await bot.tree.sync()
@@ -296,62 +311,46 @@ async def on_guild_channel_delete(channel):
         user = entry.user
         current_time = time.time()
 
-        user_actions[user.id]['channel_delete'].append((current_time, channel.id))
+        user_actions[user.id]['channel_delete'] = [a for a in user_actions[user.id]['channel_delete'] if current_time - a[0] < ACTION_TIMEFRAME]
 
-        # Immediately restore the deleted channel
         cached_channel_info = server_cache.get(guild.id, {}).get('channels', {}).get(channel.id)
         if cached_channel_info:
-            try:
-                category = guild.get_channel(cached_channel_info['category_id']) if cached_channel_info.get('category_id') else None
-                overwrites = {}
-                for role_id, perms in cached_channel_info.get('overwrites', {}).items():
-                    role = guild.get_role(role_id)
-                    if role:
-                        overwrites[role] = perms
+             user_actions[user.id]['channel_delete'].append((current_time, channel.id, cached_channel_info))
 
-                recreated_channel = None
-                channel_type = cached_channel_info['type']
-
-                if channel_type == discord.ChannelType.text:
-                    recreated_channel = await guild.create_text_channel(
-                        name=cached_channel_info['name'],
-                        category=category,
-                        topic=cached_channel_info.get('topic'),
-                        position=cached_channel_info['position'],
-                        overwrites=overwrites
-                    )
-                elif channel_type == discord.ChannelType.voice:
-                    recreated_channel = await guild.create_voice_channel(
-                        name=cached_channel_info['name'],
-                        category=category,
-                        position=cached_channel_info['position'],
-                        overwrites=overwrites
-                    )
-                elif channel_type == discord.ChannelType.category:
-                    recreated_channel = await guild.create_category(
-                        name=cached_channel_info['name'],
-                        position=cached_channel_info['position'],
-                        overwrites=overwrites
-                    )
-
-                if recreated_channel:
-                    print(f"Recreated channel '{recreated_channel.name}' in '{guild.name}'.")
-                    raid_reports[guild.id]['deleted_channels'] += 1
-
-            except discord.Forbidden:
-                print(f"Could not restore channel '{cached_channel_info['name']}'. Missing permissions.")
-            except discord.HTTPException as e:
-                print(f"Failed to restore channel '{cached_channel_info['name']}': {e}")
-
-        # Check if the user has reached the threshold for banning
         if len(user_actions[user.id]['channel_delete']) >= CHANNEL_DELETE_THRESHOLD:
-            print(f"Banning {user.name} for deleting multiple channels.")
+            print(f"Programmatic raid recovery initiated for mass channel deletion by {user.name}.")
             try:
                 await guild.ban(user, reason="Mass channel deletion.")
                 blacklist.add(user.id)
                 save_blacklist()
                 raid_reports[guild.id]['banned_users'] += 1
-                await send_raid_alert(guild, user, "Mass channel deletion.")
+
+                channels_to_restore = user_actions[user.id]['channel_delete']
+                restored_count = 0
+                for _, _, cached_info in channels_to_restore:
+                    try:
+                        category = guild.get_channel(cached_info['category_id']) if cached_info.get('category_id') else None
+                        overwrites = {}
+                        for role_id, perms in cached_info.get('overwrites', {}).items():
+                            role = guild.get_role(role_id)
+                            if role:
+                                overwrites[role] = perms
+
+                        channel_type = cached_info['type']
+                        if channel_type == discord.ChannelType.text:
+                            await guild.create_text_channel(name=cached_info['name'], category=category, position=cached_info['position'], overwrites=overwrites)
+                        elif channel_type == discord.ChannelType.voice:
+                            await guild.create_voice_channel(name=cached_info['name'], category=category, position=cached_info['position'], overwrites=overwrites)
+                        elif channel_type == discord.ChannelType.category:
+                             await guild.create_category(name=cached_info['name'], position=cached_info['position'], overwrites=overwrites)
+                        restored_count += 1
+                    except Exception as e:
+                        print(f"Failed to restore channel '{cached_info['name']}': {e}")
+
+                print(f"Restored {restored_count} channels.")
+                raid_reports[guild.id]['deleted_channels'] += restored_count
+
+                await send_raid_alert(guild, user, f"Mass channel deletion ({len(channels_to_restore)} channels). Server restored.")
                 user_actions[user.id]['channel_delete'] = []
             except discord.Forbidden:
                 print(f"Could not ban {user.name}. Missing permissions.")
@@ -530,27 +529,26 @@ async def on_webhooks_update(channel):
     This function is called when a webhook is created, updated, or deleted.
     """
     guild = channel.guild
-    entry = await get_audit_log_entry(guild, discord.AuditLogAction.webhook_create, channel.id)
+    # We only care about webhook creation for now, as spam is handled in on_message.
+    async for entry in guild.audit_logs(action=discord.AuditLogAction.webhook_create, limit=1):
+        if is_unauthorized_actor(entry.user, guild):
+            user = entry.user
+            current_time = time.time()
+            user_actions[user.id]['webhook_create'] = [t for t in user_actions[user.id]['webhook_create'] if current_time - t < ACTION_TIMEFRAME]
+            user_actions[user.id]['webhook_create'].append(current_time)
 
-    if is_unauthorized_actor(entry.user, guild):
-        user = entry.user
-        current_time = time.time()
-        user_actions[user.id]['webhook_create'] = [t for t in user_actions[user.id]['webhook_create'] if current_time - t < ACTION_TIMEFRAME]
-        user_actions[user.id]['webhook_create'].append(current_time)
-
-        if len(user_actions[user.id]['webhook_create']) >= WEBHOOK_CREATE_THRESHOLD:
-            print(f"Banning {user.name} for creating multiple webhooks.")
-            try:
-                await guild.ban(user, reason="Mass webhook creation.")
-                blacklist.add(user.id)
-                save_blacklist()
-            except discord.Forbidden:
-                print(f"Could not ban {user.name}. Missing permissions.")
-            except discord.HTTPException as e:
-                print(f"Failed to ban {user.name}: {e}")
-            else:
-                raid_reports[guild.id]['banned_users'] += 1
-                await send_raid_alert(guild, user, "Mass webhook creation.")
+            if len(user_actions[user.id]['webhook_create']) >= WEBHOOK_CREATE_THRESHOLD:
+                print(f"Banning {user.name} for creating multiple webhooks.")
+                try:
+                    await guild.ban(user, reason="Mass webhook creation.")
+                    blacklist.add(user.id)
+                    save_blacklist()
+                    raid_reports[guild.id]['banned_users'] += 1
+                    await send_raid_alert(guild, user, "Mass webhook creation.")
+                except discord.Forbidden:
+                    print(f"Could not ban {user.name}. Missing permissions.")
+                except discord.HTTPException as e:
+                    print(f"Failed to ban {user.name}: {e}")
 
 @bot.event
 async def on_message(message):
@@ -573,7 +571,7 @@ async def on_message(message):
                         if e.target.id == message.webhook_id:
                             entry = e
                             break
-                    if entry and entry.user:
+                    if entry and is_unauthorized_actor(entry.user, message.guild):
                         await message.guild.ban(entry.user, reason="Created a webhook that spammed @everyone.")
                         blacklist.add(entry.user.id)
                         save_blacklist()
@@ -597,6 +595,9 @@ async def on_message(message):
     if message.author.bot:
         return
 
+    # --- Security & Spam Checks (Run on all messages) ---
+    is_ai_mention = bot.user.mentioned_in(message) and not message.mention_everyone
+
     # Suspicious message sniping
     if any(keyword in message.content.lower() for keyword in [".nuke", ".raid"]):
         suspicious_messages[message.guild.id].append(f"[{message.created_at}] {message.author}: {message.content}")
@@ -612,7 +613,6 @@ async def on_message(message):
                 blacklist.add(message.author.id)
                 save_blacklist()
                 print(f"Banned {message.author} for spamming.")
-                # Optionally, delete the spam messages
                 await message.channel.purge(limit=SPAM_THRESHOLD, check=lambda m: m.author == message.author)
             except discord.Forbidden:
                 print(f"Could not ban {message.author}. Missing permissions.")
@@ -620,6 +620,99 @@ async def on_message(message):
                 print(f"Failed to ban {message.author}: {e}")
             else:
                 await send_raid_alert(message.guild, message.author, "Spamming.")
+            return # Stop processing after banning for spam
+
+    # --- Conversational AI Engine ---
+    if is_ai_mention:
+        if not guild_ai_state[message.guild.id]:
+            guild_ai_state[message.guild.id] = True
+            await message.channel.send("AI has been re-enabled.")
+            return
+
+        if not message.author.guild_permissions.administrator and message.author != message.guild.owner:
+            await message.channel.send("Sorry, you must be an administrator to talk to me.")
+            return
+
+        async with message.channel.typing():
+            await process_ai_command(message.channel, message.guild, message.mentions, message.content)
+
+async def process_ai_command(channel, guild, mentions, content, context=None):
+    """Processes a command given to the AI."""
+    command = context or content.replace(f'<@!{bot.user.id}>', '').strip()
+
+    try:
+        response = client.chat.completions.create(
+            model=OPENROUTER_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a Discord bot. Respond with a single JSON object in the format '{\"tool\": \"<tool_name>\", \"params\": {\"<param1>\": \"<value1>\", \"<param2>\": \"<value2>\"}}'. For user-related actions, use the 'user_id' parameter. Available tools: create_channel, delete_channel, create_role, assign_role, remove_role, ban, kick, timeout."},
+                {"role": "user", "content": command},
+            ],
+        )
+        ai_response = response.choices[0].message.content
+
+        # JSON command parser
+        try:
+            command_data = json.loads(ai_response)
+            tool_name = command_data["tool"]
+            params = command_data["params"]
+        except (json.JSONDecodeError, KeyError):
+            await channel.send(f"AI response: {ai_response}")
+            return
+
+        # Execute the command
+        if tool_name == "create_channel":
+            await ai_tools.create_channel(guild, params["name"])
+            await channel.send(f"Created channel `{params['name']}`.")
+        elif tool_name == "delete_channel":
+            target_channel = discord.utils.get(guild.channels, name=params["name"])
+            if target_channel:
+                await ai_tools.delete_channel(target_channel)
+                await channel.send(f"Deleted channel `{params['name']}`.")
+            else:
+                await channel.send(f"Channel `{params['name']}` not found.")
+        elif tool_name == "create_role":
+            await ai_tools.create_role(guild, params["name"])
+            await channel.send(f"Created role `{params['name']}`.")
+        elif tool_name in ["assign_role", "remove_role", "ban", "kick", "timeout"]:
+            member = None
+            if mentions:
+                member = mentions[0]
+            elif "user_id" in params:
+                member = guild.get_member(int(params["user_id"]))
+
+            if not member:
+                await channel.send("Could not find member.")
+                return
+
+            if tool_name == "assign_role":
+                role = discord.utils.get(guild.roles, name=params["role_name"])
+                if role:
+                    await ai_tools.assign_role(member, role)
+                    await channel.send(f"Assigned role `{params['role_name']}` to {member.mention}.")
+                else:
+                    await channel.send("Could not find role.")
+            elif tool_name == "remove_role":
+                role = discord.utils.get(guild.roles, name=params["role_name"])
+                if role:
+                    await ai_tools.remove_role(member, role)
+                    await channel.send(f"Removed role `{params['role_name']}` from {member.mention}.")
+                else:
+                    await channel.send("Could not find role.")
+            elif tool_name == "ban":
+                await ai_tools.ban_member(member)
+                await channel.send(f"Banned {member.mention}.")
+            elif tool_name == "kick":
+                await ai_tools.kick_member(member)
+                await channel.send(f"Kicked {member.mention}.")
+            elif tool_name == "timeout":
+                duration = int(params["duration"])
+                await ai_tools.timeout_member(member, duration)
+                await channel.send(f"Timed out {member.mention} for {duration} seconds.")
+        else:
+            await channel.send(f"AI response: {ai_response}")
+
+    except Exception as e:
+        await channel.send(f"An error occurred while processing your command: {e}")
 
 @bot.event
 async def on_guild_role_create(role):
@@ -734,49 +827,46 @@ async def on_guild_role_delete(role):
         user = entry.user
         current_time = time.time()
 
-        user_actions[user.id]['role_delete'] = [item for item in user_actions[user.id]['role_delete'] if current_time - item[0] < ACTION_TIMEFRAME]
-        user_actions[user.id]['role_delete'].append((current_time, role.id))
+        user_actions[user.id]['role_delete'] = [a for a in user_actions[user.id]['role_delete'] if current_time - a[0] < ACTION_TIMEFRAME]
+
+        if cached_role_info:
+            user_actions[user.id]['role_delete'].append((current_time, role.id, cached_role_info))
 
         if len(user_actions[user.id]['role_delete']) >= ROLE_DELETE_THRESHOLD:
-            print(f"Banning {user.name} for deleting multiple roles.")
+            print(f"Programmatic raid recovery initiated for mass role deletion by {user.name}.")
             try:
                 await guild.ban(user, reason="Mass role deletion.")
                 blacklist.add(user.id)
                 save_blacklist()
+                raid_reports[guild.id]['banned_users'] += 1
+
+                roles_to_restore = user_actions[user.id]['role_delete']
+                restored_count = 0
+                for _, _, cached_info in roles_to_restore:
+                    try:
+                        recreated_role = await guild.create_role(
+                            name=cached_info['name'],
+                            permissions=cached_info['permissions'],
+                            color=cached_info['color'],
+                            hoist=cached_info['hoist']
+                        )
+                        for member_id in cached_info.get('members', []):
+                            member = guild.get_member(member_id)
+                            if member:
+                                await member.add_roles(recreated_role)
+                        restored_count += 1
+                    except Exception as e:
+                        print(f"Failed to restore role '{cached_info['name']}': {e}")
+
+                print(f"Restored {restored_count} roles.")
+                raid_reports[guild.id]['deleted_roles'] += restored_count
+
+                await send_raid_alert(guild, user, f"Mass role deletion ({len(roles_to_restore)} roles). Server restored.")
+                user_actions[user.id]['role_delete'] = []
             except discord.Forbidden:
                 print(f"Could not ban {user.name}. Missing permissions.")
             except discord.HTTPException as e:
                 print(f"Failed to ban {user.name}: {e}")
-            else:
-                raid_reports[guild.id]['banned_users'] += 1
-                await send_raid_alert(guild, user, "Mass role deletion.")
-
-    # --- Role Restoration ---
-    try:
-        recreated_role = await guild.create_role(
-            name=cached_role_info['name'],
-            permissions=cached_role_info['permissions'],
-            color=cached_role_info['color'],
-            hoist=cached_role_info['hoist'],
-            mentionable=cached_role_info['mentionable']
-        )
-        print(f"Recreated role '{recreated_role.name}' in '{guild.name}'.")
-        raid_reports[guild.id]['deleted_roles'] += 1
-
-        # Re-assign the role to the original members who are still in the server
-        for member_id in cached_role_info.get('members', []):
-            member = guild.get_member(member_id)
-            if member and member in guild.members:
-                try:
-                    await member.add_roles(recreated_role)
-                except discord.Forbidden:
-                    print(f"Could not add role '{recreated_role.name}' to {member.name}. Missing permissions.")
-                except discord.HTTPException as e:
-                    print(f"Failed to add role '{recreated_role.name}' to {member.name}: {e}")
-    except discord.Forbidden:
-        print(f"Could not restore role '{cached_role_info['name']}'. Missing permissions.")
-    except discord.HTTPException as e:
-        print(f"Failed to restore role '{cached_role_info['name']}': {e}")
 
 @bot.event
 async def on_member_update(before, after):
@@ -1110,6 +1200,13 @@ async def raidreport_command(interaction: discord.Interaction):
         await interaction.response.send_message(embed=embed)
 
     raid_reports.pop(interaction.guild.id, None)
+
+@bot.tree.command(name="stop", description="Stop the AI from responding to pings.")
+@commands.has_permissions(administrator=True)
+async def stop_command(interaction: discord.Interaction):
+    """Stops the AI from responding."""
+    guild_ai_state[interaction.guild.id] = False
+    await interaction.response.send_message("AI is now stopped. Ping me again to re-enable.", ephemeral=True)
 
 # --- Main Execution ---
 if __name__ == "__main__":
